@@ -1,0 +1,85 @@
+name: Auto-create next release branch
+
+# When a major release branch (releases/vN.0) is merged into master,
+# open the next major release line (releases/v{N+1}.0) automatically and
+# a draft PR back to master to track that release.
+# Minor patch branches (releases/vN.1, vN.2, ...) are ignored — the ".0"
+# suffix is what marks a major release here.
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - master
+
+jobs:
+  next-release-branch:
+    name: Create next major release branch
+    # Only on a real merge, and only for major release heads (releases/vN.0).
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'releases/v') &&
+      endsWith(github.event.pull_request.head.ref, '.0')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - name: Compute next major version
+        id: ver
+        env:
+          MERGED_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          # MERGED_REF looks like: releases/v869.0
+          if [[ ! "$MERGED_REF" =~ ^releases/v([0-9]+)\.0$ ]]; then
+            echo "::notice::'$MERGED_REF' is not a major release branch, skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          current_major="${BASH_REMATCH[1]}"
+          # 10# forces base-10 so a leading zero is not read as octal.
+          next_major=$(( 10#${current_major} + 1 ))
+          echo "branch=releases/v${next_major}.0" >> "$GITHUB_OUTPUT"
+
+      - name: Create next release branch and draft PR
+        if: steps.ver.outputs.skip != 'true'
+        env:
+          NEXT_BRANCH: ${{ steps.ver.outputs.branch }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Create the branch only if it doesn't exist yet. A previous run may
+          # have pushed the branch but failed before opening the PR, so branch
+          # existence alone must NOT short-circuit the PR step below.
+          if git ls-remote --exit-code --heads origin "$NEXT_BRANCH" >/dev/null 2>&1; then
+            echo "::notice::$NEXT_BRANCH already exists, skipping branch creation."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git switch -c "$NEXT_BRANCH" master
+            # Seed the release line with an empty commit so the draft PR has a
+            # non-empty diff — GitHub rejects a PR with no commits between base
+            # and head. Real release commits land on top of this.
+            git commit --allow-empty -m "chore: open ${NEXT_BRANCH} release line"
+            git push origin "$NEXT_BRANCH"
+            echo "::notice::Created $NEXT_BRANCH from master."
+          fi
+          # Open the draft PR only if one isn't already open for this branch, so
+          # a rerun after a mid-run failure can still create the missing PR.
+          if [ -n "$(gh pr list --head "$NEXT_BRANCH" --base master --state open --json number --jq '.[0].number // ""')" ]; then
+            echo "::notice::A PR for $NEXT_BRANCH is already open, nothing to do."
+          else
+            gh pr create \
+              --draft \
+              --base master \
+              --head "$NEXT_BRANCH" \
+              --title "Release ${NEXT_BRANCH}" \
+              --body "Draft release PR for \`${NEXT_BRANCH}\`, opened automatically when the previous major release branch was merged. Release commits land here; mark it ready for review when the release is cut."
+            echo "::notice::Opened draft PR for $NEXT_BRANCH."
+          fi
