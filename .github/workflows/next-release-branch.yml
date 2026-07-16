@@ -1,8 +1,10 @@
 name: Auto-create next release branch
 
-# When a major release branch (releases/vN.0) is merged into master,
-# open the next major release line (releases/v{N+1}.0) automatically and
-# a draft PR back to master to track that release.
+# When a major release branch (releases/vN.0) is merged into master:
+#   1. tag the merged release (vN.0) on the merge commit,
+#   2. publish a GitHub Release whose notes are aggregated from the
+#      "## Release Notes" section of every PR bundled in the release,
+#   3. open the next major release line (releases/v{N+1}.0) + its draft PR.
 # Minor patch branches (releases/vN.1, vN.2, ...) are ignored — the ".0"
 # suffix is what marks a major release here.
 
@@ -29,8 +31,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: master
+          # Full history + tags: the release-notes step walks merge commits
+          # since the previous release tag.
+          fetch-depth: 0
 
-      - name: Compute next major version
+      - name: Compute versions
         id: ver
         env:
           MERGED_REF: ${{ github.event.pull_request.head.ref }}
@@ -45,7 +50,123 @@ jobs:
           current_major="${BASH_REMATCH[1]}"
           # 10# forces base-10 so a leading zero is not read as octal.
           next_major=$(( 10#${current_major} + 1 ))
+          prev_major=$(( 10#${current_major} - 1 ))
+          # Tag the release that just merged (v{current}.0), not the new line.
+          echo "tag=v${current_major}.0" >> "$GITHUB_OUTPUT"
+          echo "prev_tag=v${prev_major}.0" >> "$GITHUB_OUTPUT"
           echo "branch=releases/v${next_major}.0" >> "$GITHUB_OUTPUT"
+
+      - name: Tag the merged release
+        if: steps.ver.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          # Untrusted inputs — passed via env, never inline in the script.
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          MERGED_AT: ${{ github.event.pull_request.merged_at }}
+        run: |
+          set -euo pipefail
+          # Idempotent: a rerun after a mid-run failure must not fail on a
+          # tag that a previous run already pushed.
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::notice::Tag $TAG already exists, skipping."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            printf '%s\n\n%s\n%s\n%s\n' \
+              "Release $TAG" \
+              "PR #${PR_NUMBER}: ${PR_TITLE}" \
+              "Merged: ${MERGED_AT}" \
+              "${PR_URL}" > "$RUNNER_TEMP/tag-msg.txt"
+            git tag -a "$TAG" -F "$RUNNER_TEMP/tag-msg.txt"
+            git push origin "refs/tags/${TAG}"
+            echo "::notice::Tagged $TAG on master."
+          fi
+
+      - name: Publish GitHub Release with aggregated notes
+        if: steps.ver.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          PREV_TAG: ${{ steps.ver.outputs.prev_tag }}
+          MERGED_AT: ${{ github.event.pull_request.merged_at }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Idempotent: don't clobber a release a previous run already published.
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "::notice::Release $TAG already exists, skipping."
+            exit 0
+          fi
+
+          # Range: everything since the previous major release tag, or all
+          # history when this is the first tag.
+          if git ls-remote --exit-code --tags origin "refs/tags/${PREV_TAG}" >/dev/null 2>&1; then
+            range="${PREV_TAG}..HEAD"
+          else
+            range="HEAD"
+          fi
+
+          # Template-driven: read the release-notes heading from the PR template
+          # instead of hardcoding it, so renaming/reordering sections or changing
+          # this heading's level or casing does not break the flow. We locate the
+          # section semantically (a heading mentioning "release" + "note").
+          template=".github/PULL_REQUEST_TEMPLATE.md"
+          rn_heading=""
+          if [ -f "$template" ]; then
+            rn_heading=$(grep -iE '^#+[[:space:]]+.*release.*note' "$template" | head -1 || true)
+          fi
+          # Fallback keeps the flow working even if the template is missing/renamed.
+          [ -z "$rn_heading" ] && rn_heading="## Release Notes"
+          echo "::notice::Release-notes heading: ${rn_heading}"
+
+          # PRs bundled in this release = merge commits in range, minus the
+          # release-line merges themselves (head ref under releases/v*).
+          mapfile -t prs < <(
+            git log $range --merges --grep='Merge pull request #' --pretty='%s' \
+              | grep -v 'from [^ ]*/releases/v' \
+              | sed -nE 's/^Merge pull request #([0-9]+).*/\1/p' \
+              | sort -un
+          )
+
+          bugs=""
+          changes=""
+          for n in "${prs[@]}"; do
+            title=$(gh pr view "$n" --repo "$REPO" --json title --jq '.title')
+            body=$(gh pr view "$n" --repo "$REPO" --json body --jq '.body')
+            # Text under the release-notes heading, up to the next heading or the
+            # template footer separator ("----"), whichever comes first.
+            notes=$(printf '%s\n' "$body" \
+              | awk -v h="$rn_heading" '
+                  index($0, h) == 1 && !f { f = 1; next }
+                  f && /^#+[[:space:]]/ { exit }
+                  f && /^----/ { exit }
+                  f { print }' \
+              | sed '/^[[:space:]]*$/d')
+            # Fall back to the PR title so a PR is never silently dropped.
+            [ -z "$notes" ] && notes="$title"
+            # Normalise to one clean bullet per line (strip any existing marker).
+            bullet=$(printf '%s\n' "$notes" | sed -E 's/^[[:space:]]*[-*][[:space:]]+//; s/^/- /')
+            case "$title" in
+              [Ff]ix:*|[Hh]otfix:*) bugs="${bugs}${bullet}"$'\n' ;;
+              *) changes="${changes}${bullet}"$'\n' ;;
+            esac
+          done
+
+          date_str="${MERGED_AT%%T*}"
+          {
+            echo "## ${TAG} — ${date_str}"
+            echo
+            if [ -n "$bugs" ]; then echo "### Bug fixes"; printf '%s\n' "$bugs"; fi
+            if [ -n "$changes" ]; then echo "### Changes"; printf '%s\n' "$changes"; fi
+            if [ -z "${bugs}${changes}" ]; then echo "_No bundled PRs with release notes found._"; fi
+          } > "$RUNNER_TEMP/relnotes.md"
+
+          gh release create "$TAG" --repo "$REPO" --verify-tag \
+            --title "$TAG" --notes-file "$RUNNER_TEMP/relnotes.md"
+          echo "::notice::Published release $TAG."
 
       - name: Create next release branch and draft PR
         if: steps.ver.outputs.skip != 'true'
