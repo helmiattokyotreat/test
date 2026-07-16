@@ -101,9 +101,15 @@ jobs:
             exit 0
           fi
 
-          # Range: everything since the previous major release tag, or all
-          # history when this is the first tag.
-          if git ls-remote --exit-code --tags origin "refs/tags/${PREV_TAG}" >/dev/null 2>&1; then
+          # The release's own commits = everything the merged release branch
+          # added over master. HEAD is the merge commit; HEAD^1 is the master
+          # tip before the merge, HEAD^2 the release-branch tip. HEAD^1..HEAD^2
+          # is tag-independent and, by construction, excludes anything merged
+          # straight to master (chore/infra PRs never appear in a release).
+          if git rev-parse -q --verify HEAD^2 >/dev/null 2>&1; then
+            range="HEAD^1..HEAD^2"
+          # Fallback for a fast-forward merge (no merge commit): since prev tag.
+          elif git ls-remote --exit-code --tags origin "refs/tags/${PREV_TAG}" >/dev/null 2>&1; then
             range="${PREV_TAG}..HEAD"
           else
             range="HEAD"
