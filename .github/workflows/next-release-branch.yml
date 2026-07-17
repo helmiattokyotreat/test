@@ -202,11 +202,15 @@ jobs:
           if [ -n "$(gh pr list --head "$NEXT_BRANCH" --base master --state open --json number --jq '.[0].number // ""')" ]; then
             echo "::notice::A PR for $NEXT_BRANCH is already open, nothing to do."
           else
+            # Ensure the label exists so --label never hard-fails the run
+            # (idempotent; no-op if it already exists).
+            gh label create release --color C3CC48 2>/dev/null || true
             gh pr create \
               --draft \
               --base master \
               --head "$NEXT_BRANCH" \
               --title "Release ${NEXT_BRANCH}" \
+              --label release \
               --body "Draft release PR for \`${NEXT_BRANCH}\`, opened automatically when the previous major release branch was merged. Release commits land here; mark it ready for review when the release is cut."
             echo "::notice::Opened draft PR for $NEXT_BRANCH."
           fi
