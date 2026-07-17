@@ -3,7 +3,9 @@ name: Auto-create next release branch
 # When a major release branch (releases/vN.0) is merged into master:
 #   1. tag the merged release (vN.0) on the merge commit,
 #   2. publish a GitHub Release whose notes are aggregated from the
-#      "## Release Notes" section of every PR bundled in the release,
+#      "## Release Notes" section of every PR shipping in the release — i.e.
+#      every PR merged into master since the previous release tag, including
+#      hotfixes merged straight to master, not just release-branch PRs,
 #   3. rewrite the merged release PR's description into the repo PR template
 #      (Overview / Features & Fixes / Additional changes / How to test /
 #      Post deploy script / Release Notes), aggregated from the bundled PRs,
@@ -104,16 +106,19 @@ jobs:
             exit 0
           fi
 
-          # The release's own commits = everything the merged release branch
-          # added over master. HEAD is the merge commit; HEAD^1 is the master
-          # tip before the merge, HEAD^2 the release-branch tip. HEAD^1..HEAD^2
-          # is tag-independent and, by construction, excludes anything merged
-          # straight to master (chore/infra PRs never appear in a release).
-          if git rev-parse -q --verify HEAD^2 >/dev/null 2>&1; then
-            range="HEAD^1..HEAD^2"
-          # Fallback for a fast-forward merge (no merge commit): since prev tag.
-          elif git ls-remote --exit-code --tags origin "refs/tags/${PREV_TAG}" >/dev/null 2>&1; then
+          # Everything shipping in this release = all commits added to master
+          # since the previous release tag (PREV_TAG..HEAD). HEAD is the release
+          # merge commit. This range deliberately includes PRs merged straight
+          # to master between releases (e.g. hotfixes), not only the ones routed
+          # through the release branch — otherwise a hotfix that ships on master
+          # would be missing from the release notes. The release-line merge
+          # commit itself is filtered out below.
+          if git ls-remote --exit-code --tags origin "refs/tags/${PREV_TAG}" >/dev/null 2>&1; then
             range="${PREV_TAG}..HEAD"
+          # First release (no previous tag): fall back to the release-branch side
+          # of the merge commit (HEAD^2), or HEAD if it was a fast-forward merge.
+          elif git rev-parse -q --verify HEAD^2 >/dev/null 2>&1; then
+            range="HEAD^1..HEAD^2"
           else
             range="HEAD"
           fi
@@ -189,15 +194,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Same bundled-PR derivation as the release-notes step (HEAD^1..HEAD^2,
-          # excluding the release-line merges). Kept parallel on purpose: that
-          # step builds the tag's notes, this one builds the human-facing PR
-          # description from the same set of PRs. gh pr edit is idempotent, so a
-          # rerun simply rewrites the body.
-          if git rev-parse -q --verify HEAD^2 >/dev/null 2>&1; then
-            range="HEAD^1..HEAD^2"
-          elif git ls-remote --exit-code --tags origin "refs/tags/${PREV_TAG}" >/dev/null 2>&1; then
+          # Same PR set as the release-notes step: everything on master since the
+          # previous release tag (PREV_TAG..HEAD), which includes hotfixes merged
+          # straight to master, not just release-branch PRs. Kept parallel on
+          # purpose — that step builds the tag's notes, this one the PR body.
+          # gh pr edit is idempotent, so a rerun simply rewrites the body.
+          if git ls-remote --exit-code --tags origin "refs/tags/${PREV_TAG}" >/dev/null 2>&1; then
             range="${PREV_TAG}..HEAD"
+          elif git rev-parse -q --verify HEAD^2 >/dev/null 2>&1; then
+            range="HEAD^1..HEAD^2"
           else
             range="HEAD"
           fi
