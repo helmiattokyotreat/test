@@ -194,15 +194,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Same PR set as the release-notes step: everything on master since the
-          # previous release tag (PREV_TAG..HEAD), which includes hotfixes merged
-          # straight to master, not just release-branch PRs. Kept parallel on
-          # purpose — that step builds the tag's notes, this one the PR body.
-          # gh pr edit is idempotent, so a rerun simply rewrites the body.
-          if git ls-remote --exit-code --tags origin "refs/tags/${PREV_TAG}" >/dev/null 2>&1; then
-            range="${PREV_TAG}..HEAD"
-          elif git rev-parse -q --verify HEAD^2 >/dev/null 2>&1; then
+          # The PR description mirrors THIS release PR's own diff: only the PRs
+          # merged into the release branch (HEAD^1..HEAD^2). This is narrower than
+          # the tag notes on purpose — the tag covers everything shipping on
+          # master (incl. hotfixes merged straight to master), but a direct-to-
+          # master PR is not part of this PR's Files changed, so listing it in the
+          # description would contradict the diff. gh pr edit is idempotent.
+          if git rev-parse -q --verify HEAD^2 >/dev/null 2>&1; then
             range="HEAD^1..HEAD^2"
+          # Fast-forward merge (no merge commit): fall back to since prev tag.
+          elif git ls-remote --exit-code --tags origin "refs/tags/${PREV_TAG}" >/dev/null 2>&1; then
+            range="${PREV_TAG}..HEAD"
           else
             range="HEAD"
           fi
