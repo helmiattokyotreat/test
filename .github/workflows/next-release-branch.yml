@@ -4,7 +4,10 @@ name: Auto-create next release branch
 #   1. tag the merged release (vN.0) on the merge commit,
 #   2. publish a GitHub Release whose notes are aggregated from the
 #      "## Release Notes" section of every PR bundled in the release,
-#   3. open the next major release line (releases/v{N+1}.0) + its draft PR.
+#   3. rewrite the merged release PR's description into the repo PR template
+#      (Overview / Features & Fixes / Additional changes / How to test /
+#      Post deploy script / Release Notes), aggregated from the bundled PRs,
+#   4. open the next major release line (releases/v{N+1}.0) + its draft PR.
 # Minor patch branches (releases/vN.1, vN.2, ...) are ignored — the ".0"
 # suffix is what marks a major release here.
 
@@ -173,6 +176,114 @@ jobs:
           gh release create "$TAG" --repo "$REPO" --verify-tag \
             --title "$TAG" --notes-file "$RUNNER_TEMP/relnotes.md"
           echo "::notice::Published release $TAG."
+
+      - name: Rewrite the merged release PR description
+        if: steps.ver.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          PREV_TAG: ${{ steps.ver.outputs.prev_tag }}
+          MERGED_AT: ${{ github.event.pull_request.merged_at }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Same bundled-PR derivation as the release-notes step (HEAD^1..HEAD^2,
+          # excluding the release-line merges). Kept parallel on purpose: that
+          # step builds the tag's notes, this one builds the human-facing PR
+          # description from the same set of PRs. gh pr edit is idempotent, so a
+          # rerun simply rewrites the body.
+          if git rev-parse -q --verify HEAD^2 >/dev/null 2>&1; then
+            range="HEAD^1..HEAD^2"
+          elif git ls-remote --exit-code --tags origin "refs/tags/${PREV_TAG}" >/dev/null 2>&1; then
+            range="${PREV_TAG}..HEAD"
+          else
+            range="HEAD"
+          fi
+
+          mapfile -t prs < <(
+            git log $range --merges --grep='Merge pull request #' --pretty='%s' \
+              | grep -v 'from [^ ]*/releases/v' \
+              | sed -nE 's/^Merge pull request #([0-9]+).*/\1/p' \
+              | sort -un
+          )
+
+          # Text under a heading matched loosely by keyword(s), stopping at the
+          # next heading or the template footer separator. $1=body $2=lowercased
+          # heading-keyword regex. Untrusted PR bodies only ever pass through
+          # awk stdin / files — never interpolated into a command.
+          section() {
+            printf '%s\n' "$1" | awk -v re="$2" '
+              tolower($0) ~ ("^#+[[:space:]]+" re) && !f { f = 1; next }
+              f && /^#+[[:space:]]/ { exit }
+              f && /^----/ { exit }
+              f { print }' | sed -e '/^[[:space:]]*$/d'
+          }
+
+          feats=""; bugs=""; changes=""; addl=""; test_steps=""; postdeploy=""; links=""
+          for n in "${prs[@]}"; do
+            title=$(gh pr view "$n" --repo "$REPO" --json title --jq '.title')
+            url=$(gh pr view "$n" --repo "$REPO" --json url --jq '.url')
+            body=$(gh pr view "$n" --repo "$REPO" --json body --jq '.body')
+
+            rn=$(section "$body" ".*release.*note")
+            [ -z "$rn" ] && rn="$title"
+            headline=$(printf '%s\n' "$rn" | sed -E 's/^[[:space:]]*[-*][[:space:]]+//' | head -1)
+
+            # Features & Fixes: one PR-linked bullet each.
+            feats="${feats}- **${title}** (#${n})${headline:+ — ${headline}}"$'\n'
+            links="${links}#${n}, "
+
+            # Release Notes: grouped fix/hotfix vs everything else.
+            bullet=$(printf '%s\n' "$rn" | sed -E 's/^[[:space:]]*[-*][[:space:]]+//; s/^/- /')
+            case "$title" in
+              [Ff]ix:*|[Hh]otfix:*) bugs="${bugs}${bullet}"$'\n' ;;
+              *) changes="${changes}${bullet}"$'\n' ;;
+            esac
+
+            a=$(section "$body" ".*additional.*change")
+            [ -n "$a" ] && addl="${addl}${a}"$'\n'
+            t=$(section "$body" ".*how.*to.*test")
+            [ -n "$t" ] && test_steps="${test_steps}**${title} (#${n})**"$'\n'"${t}"$'\n\n'
+            p=$(section "$body" ".*post.*deploy")
+            [ -n "$p" ] && postdeploy="${postdeploy}**${title} (#${n})** — ${url}"$'\n'"${p}"$'\n\n'
+          done
+          links="${links%, }"
+
+          date_str="${MERGED_AT%%T*}"
+          {
+            echo "## Overview"
+            echo
+            if [ -n "$links" ]; then
+              echo "Release \`${TAG}\` (${date_str}). Bundles ${links}."
+            else
+              echo "Release \`${TAG}\` (${date_str})."
+            fi
+            echo
+            echo "## Features & Fixes"
+            echo
+            if [ -n "$feats" ]; then printf '%s\n' "$feats"; else echo "_None._"; fi
+            echo "## Additional changes"
+            echo
+            if [ -n "$addl" ]; then printf '%s\n' "$addl"; else echo "_None._"; fi
+            echo
+            echo "## How to test"
+            echo
+            if [ -n "$test_steps" ]; then printf '%s\n' "$test_steps"; else echo "_See the bundled PRs._"; fi
+            echo "## Post deploy script"
+            echo
+            if [ -n "$postdeploy" ]; then printf '%s\n' "$postdeploy"; else echo "_None._"; fi
+            echo
+            echo "## Release Notes"
+            echo
+            if [ -n "$bugs" ]; then echo "### Bug fixes"; printf '%s\n' "$bugs"; fi
+            if [ -n "$changes" ]; then echo "### Changes"; printf '%s\n' "$changes"; fi
+            if [ -z "${bugs}${changes}" ]; then echo "_No bundled PRs with release notes found._"; fi
+          } > "$RUNNER_TEMP/pr-body.md"
+
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --body-file "$RUNNER_TEMP/pr-body.md"
+          echo "::notice::Rewrote description of PR #${PR_NUMBER}."
 
       - name: Create next release branch and draft PR
         if: steps.ver.outputs.skip != 'true'
