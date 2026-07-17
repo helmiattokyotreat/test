@@ -55,11 +55,22 @@ jobs:
           current_major="${BASH_REMATCH[1]}"
           # 10# forces base-10 so a leading zero is not read as octal.
           next_major=$(( 10#${current_major} + 1 ))
-          prev_major=$(( 10#${current_major} - 1 ))
           # Tag the release that just merged (v{current}.0), not the new line.
           echo "tag=v${current_major}.0" >> "$GITHUB_OUTPUT"
-          echo "prev_tag=v${prev_major}.0" >> "$GITHUB_OUTPUT"
           echo "branch=releases/v${next_major}.0" >> "$GITHUB_OUTPUT"
+          # Previous SHIPPED release = the most recent release tag reachable from
+          # HEAD, of ANY kind — a major (v{N-1}.0) OR a patch/hotfix tag shipped
+          # straight from master between majors (v{N-1}.1, v{N-1}.2, ...). Using
+          # the previous *major* here would re-list everything already shipped in
+          # those intervening patch releases. --merged HEAD keeps only ancestors
+          # (actually-shipped) tags; -v:refname version-sorts so the newest wins.
+          # Excludes this release's own tag in case of a rerun. Empty on the very
+          # first release (the range logic then falls back).
+          prev_tag=$(git tag --merged HEAD --sort=-v:refname \
+            | grep -E '^v[0-9]+\.[0-9]+$' \
+            | grep -vFx "v${current_major}.0" \
+            | head -1 || true)
+          echo "prev_tag=${prev_tag}" >> "$GITHUB_OUTPUT"
 
       - name: Tag the merged release
         if: steps.ver.outputs.skip != 'true'
@@ -178,7 +189,10 @@ jobs:
             if [ -z "${bugs}${changes}" ]; then echo "_No bundled PRs with release notes found._"; fi
           } > "$RUNNER_TEMP/relnotes.md"
 
-          gh release create "$TAG" --repo "$REPO" --verify-tag \
+          # --latest is explicit: this workflow automates release publication, so
+          # the newly published release must reliably become the repo's Latest
+          # release rather than relying on GitHub's implicit selection.
+          gh release create "$TAG" --repo "$REPO" --verify-tag --latest \
             --title "$TAG" --notes-file "$RUNNER_TEMP/relnotes.md"
           echo "::notice::Published release $TAG."
 
