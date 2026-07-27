@@ -10,6 +10,8 @@ name: Auto-create next release branch
 #      (Overview / Features & Fixes / Additional changes / How to test /
 #      Post deploy script / Release Notes), aggregated from the bundled PRs,
 #   4. open the next major release line (releases/v{N+1}.0) + its draft PR.
+# Also, when a feature PR is merged into an open release branch, incrementally
+# sync the open release→master PR's description to reflect the PRs bundled so far.
 # Minor patch branches (releases/vN.1, vN.2, ...) are ignored — the ".0"
 # suffix is what marks a major release here.
 
@@ -18,13 +20,16 @@ on:
     types: [closed]
     branches:
       - master
+      - 'releases/v*'
 
 jobs:
   next-release-branch:
     name: Create next major release branch
-    # Only on a real merge, and only for major release heads (releases/vN.0).
+    # Only on a real merge, and only for major release heads (releases/vN.0)
+    # merging INTO master (not feature PRs merging into a release branch).
     if: >-
       github.event.pull_request.merged == true &&
+      github.event.pull_request.base.ref == 'master' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       startsWith(github.event.pull_request.head.ref, 'releases/v') &&
       endsWith(github.event.pull_request.head.ref, '.0')
@@ -150,7 +155,7 @@ jobs:
           # PRs bundled in this release = merge commits in range, minus the
           # release-line merges themselves (head ref under releases/v*).
           mapfile -t prs < <(
-            git log $range --merges --grep='Merge pull request #' --pretty='%s' \
+            git log "$range" --merges --grep='Merge pull request #' --pretty='%s' \
               | grep -v 'from [^ ]*/releases/v' \
               | sed -nE 's/^Merge pull request #([0-9]+).*/\1/p' \
               | sort -un
@@ -223,86 +228,10 @@ jobs:
             range="HEAD"
           fi
 
-          mapfile -t prs < <(
-            git log $range --merges --grep='Merge pull request #' --pretty='%s' \
-              | grep -v 'from [^ ]*/releases/v' \
-              | sed -nE 's/^Merge pull request #([0-9]+).*/\1/p' \
-              | sort -un
-          )
-
-          # Text under a heading matched loosely by keyword(s), stopping at the
-          # next heading or the template footer separator. $1=body $2=lowercased
-          # heading-keyword regex. Untrusted PR bodies only ever pass through
-          # awk stdin / files — never interpolated into a command.
-          section() {
-            printf '%s\n' "$1" | awk -v re="$2" '
-              tolower($0) ~ ("^#+[[:space:]]+" re) && !f { f = 1; next }
-              f && /^#+[[:space:]]/ { exit }
-              f && /^----/ { exit }
-              f { print }' | sed -e '/^[[:space:]]*$/d'
-          }
-
-          feats=""; bugs=""; changes=""; addl=""; test_steps=""; postdeploy=""; links=""
-          for n in "${prs[@]}"; do
-            title=$(gh pr view "$n" --repo "$REPO" --json title --jq '.title')
-            url=$(gh pr view "$n" --repo "$REPO" --json url --jq '.url')
-            body=$(gh pr view "$n" --repo "$REPO" --json body --jq '.body')
-
-            rn=$(section "$body" ".*release.*note")
-            [ -z "$rn" ] && rn="$title"
-            headline=$(printf '%s\n' "$rn" | sed -E 's/^[[:space:]]*[-*][[:space:]]+//' | head -1)
-
-            # Features & Fixes: one PR-linked bullet each.
-            feats="${feats}- **${title}** (#${n})${headline:+ — ${headline}}"$'\n'
-            links="${links}#${n}, "
-
-            # Release Notes: grouped fix/hotfix vs everything else.
-            bullet=$(printf '%s\n' "$rn" | sed -E 's/^[[:space:]]*[-*][[:space:]]+//; s/^/- /')
-            case "$title" in
-              [Ff]ix:*|[Hh]otfix:*) bugs="${bugs}${bullet}"$'\n' ;;
-              *) changes="${changes}${bullet}"$'\n' ;;
-            esac
-
-            a=$(section "$body" ".*additional.*change")
-            [ -n "$a" ] && addl="${addl}${a}"$'\n'
-            t=$(section "$body" ".*how.*to.*test")
-            [ -n "$t" ] && test_steps="${test_steps}**${title} (#${n})**"$'\n'"${t}"$'\n\n'
-            p=$(section "$body" ".*post.*deploy")
-            [ -n "$p" ] && postdeploy="${postdeploy}**${title} (#${n})** — ${url}"$'\n'"${p}"$'\n\n'
-          done
-          links="${links%, }"
-
           date_str="${MERGED_AT%%T*}"
-          {
-            echo "## Overview"
-            echo
-            if [ -n "$links" ]; then
-              echo "Release \`${TAG}\` (${date_str}). Bundles ${links}."
-            else
-              echo "Release \`${TAG}\` (${date_str})."
-            fi
-            echo
-            echo "## Features & Fixes"
-            echo
-            if [ -n "$feats" ]; then printf '%s\n' "$feats"; else echo "_None._"; fi
-            echo "## Additional changes"
-            echo
-            if [ -n "$addl" ]; then printf '%s\n' "$addl"; else echo "_None._"; fi
-            echo
-            echo "## How to test"
-            echo
-            if [ -n "$test_steps" ]; then printf '%s\n' "$test_steps"; else echo "_See the bundled PRs._"; fi
-            echo "## Post deploy script"
-            echo
-            if [ -n "$postdeploy" ]; then printf '%s\n' "$postdeploy"; else echo "_None._"; fi
-            echo
-            echo "## Release Notes"
-            echo
-            if [ -n "$bugs" ]; then echo "### Bug fixes"; printf '%s\n' "$bugs"; fi
-            if [ -n "$changes" ]; then echo "### Changes"; printf '%s\n' "$changes"; fi
-            if [ -z "${bugs}${changes}" ]; then echo "_No bundled PRs with release notes found._"; fi
-          } > "$RUNNER_TEMP/pr-body.md"
-
+          body=$(bash .github/scripts/build_release_pr_body.sh "$range" \
+            "Release \`${TAG}\` (${date_str}).")
+          printf '%s\n' "$body" > "$RUNNER_TEMP/pr-body.md"
           gh pr edit "$PR_NUMBER" --repo "$REPO" --body-file "$RUNNER_TEMP/pr-body.md"
           echo "::notice::Rewrote description of PR #${PR_NUMBER}."
 
@@ -346,3 +275,49 @@ jobs:
               --body "Draft release PR for \`${NEXT_BRANCH}\`, opened automatically when the previous major release branch was merged. Release commits land here; mark it ready for review when the release is cut."
             echo "::notice::Opened draft PR for $NEXT_BRANCH."
           fi
+
+  sync-release-pr-description:
+    name: Sync open release PR description
+    concurrency:
+      group: sync-release-pr-${{ github.event.pull_request.base.ref }}
+      cancel-in-progress: false
+    # Fires when a PR merges INTO a major release branch (releases/vN.0). Keeps
+    # the open release->master PR body in sync with the feature PRs bundled so
+    # far, instead of only rewriting it when the release itself merges to master.
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.base.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.base.ref, 'releases/v') &&
+      endsWith(github.event.pull_request.base.ref, '.0')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 0
+
+      - name: Sync the open release PR description
+        env:
+          RELEASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Only sync if a release->master PR is already open for this branch.
+          # Patch lines with no draft PR (or a not-yet-opened one) are a no-op.
+          pr_number=$(gh pr list --repo "$REPO" --head "$RELEASE_BRANCH" --base master \
+            --state open --json number --jq '.[0].number // ""')
+          if [ -z "$pr_number" ]; then
+            echo "::notice::No open release PR for $RELEASE_BRANCH; nothing to sync."
+            exit 0
+          fi
+          # Bundled so far = commits on the release branch not yet on master.
+          git fetch origin master --quiet
+          body=$(bash .github/scripts/build_release_pr_body.sh "origin/master..HEAD" \
+            "Release branch \`${RELEASE_BRANCH}\` — in progress.")
+          printf '%s\n' "$body" > "$RUNNER_TEMP/pr-body.md"
+          gh pr edit "$pr_number" --repo "$REPO" --body-file "$RUNNER_TEMP/pr-body.md"
+          echo "::notice::Synced description of PR #${pr_number}."
