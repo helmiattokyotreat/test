@@ -155,9 +155,9 @@ jobs:
           # PRs bundled in this release = merge commits in range, minus the
           # release-line merges themselves (head ref under releases/v*).
           mapfile -t prs < <(
-            git log "$range" --merges --grep='Merge pull request #' --pretty='%s' \
+            git log "$range" --pretty=%s \
               | grep -v 'from [^ ]*/releases/v' \
-              | sed -nE 's/^Merge pull request #([0-9]+).*/\1/p' \
+              | sed -nE 's/.*\(#([0-9]+)\)[[:space:]]*$/\1/p; s/^Merge pull request #([0-9]+).*/\1/p' \
               | sort -un
           )
 

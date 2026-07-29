@@ -27,9 +27,9 @@ section() {
 }
 
 mapfile -t prs < <(
-  git log "$RANGE" --merges --grep='Merge pull request #' --pretty='%s' \
+  git log "$RANGE" --pretty=%s \
     | grep -v 'from [^ ]*/releases/v' \
-    | sed -nE 's/^Merge pull request #([0-9]+).*/\1/p' \
+    | sed -nE 's/.*\(#([0-9]+)\)[[:space:]]*$/\1/p; s/^Merge pull request #([0-9]+).*/\1/p' \
     | sort -un
 )
 
