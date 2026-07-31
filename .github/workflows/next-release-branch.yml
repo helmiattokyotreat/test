@@ -76,6 +76,13 @@ jobs:
             | grep -vFx "v${current_major}.0" \
             | head -1 || true)
           echo "prev_tag=${prev_tag}" >> "$GITHUB_OUTPUT"
+          # Landing-type detection: merge commits have HEAD^2 (two parents);
+          # squash commits have only HEAD^1 (one parent).
+          if git rev-parse -q --verify HEAD^2 >/dev/null 2>&1; then
+            echo "landing=merge" >> "$GITHUB_OUTPUT"
+          else
+            echo "landing=squash" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Tag the merged release
         if: steps.ver.outputs.skip != 'true'
@@ -110,7 +117,10 @@ jobs:
         env:
           TAG: ${{ steps.ver.outputs.tag }}
           PREV_TAG: ${{ steps.ver.outputs.prev_tag }}
+          LANDING: ${{ steps.ver.outputs.landing }}
+          MERGED_REF: ${{ github.event.pull_request.head.ref }}
           MERGED_AT: ${{ github.event.pull_request.merged_at }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
@@ -122,22 +132,50 @@ jobs:
             exit 0
           fi
 
-          # Everything shipping in this release = all commits added to master
-          # since the previous release tag (PREV_TAG..HEAD). HEAD is the release
-          # merge commit. This range deliberately includes PRs merged straight
-          # to master between releases (e.g. hotfixes), not only the ones routed
-          # through the release branch — otherwise a hotfix that ships on master
-          # would be missing from the release notes. The release-line merge
-          # commit itself is filtered out below.
-          if git ls-remote --exit-code --tags origin "refs/tags/${PREV_TAG}" >/dev/null 2>&1; then
-            range="${PREV_TAG}..HEAD"
-          # First release (no previous tag): fall back to the release-branch side
-          # of the merge commit (HEAD^2), or HEAD if it was a fast-forward merge.
-          elif git rev-parse -q --verify HEAD^2 >/dev/null 2>&1; then
-            range="HEAD^1..HEAD^2"
+          # Source A: Feature PRs that landed on the release branch (either side of merge)
+          # Source B: Hotfixes merged straight to master between releases (master side only)
+          # Combined: everything shipping in this release.
+          if [ "$LANDING" = "merge" ]; then
+            # Merge commit: HEAD^2 is the release branch, HEAD^1 is master.
+            # Feature PRs: commits on release branch that are not the release merge itself.
+            mapfile -t feature_prs < <(
+              git log HEAD^1..HEAD^2 --first-parent --pretty='%s' \
+                | sed -nE 's/.*\(#([0-9]+)\)[[:space:]]*$/\1/p; s/^Merge pull request #([0-9]+).*/\1/p' \
+                | sort -un
+            )
           else
-            range="HEAD"
+            # Squash commit: release branch ref must be fetched, as the commit itself is
+            # already on master. Try to fetch the branch; if deleted, fall back to the
+            # PR description's Bundles line (maintained by sync job).
+            feature_prs=()
+            if git fetch origin "$MERGED_REF" --quiet 2>/dev/null; then
+              mapfile -t feature_prs < <(
+                git log HEAD^1..FETCH_HEAD --first-parent --pretty='%s' \
+                  | sed -nE 's/.*\(#([0-9]+)\)[[:space:]]*$/\1/p; s/^Merge pull request #([0-9]+).*/\1/p' \
+                  | sort -un
+              )
+            else
+              # Branch deleted: parse the Bundles line from the PR body.
+              synced_body=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json body --jq '.body')
+              mapfile -t feature_prs < <(printf '%s\n' "$synced_body" | grep '^Release.*Bundles ' | grep -oE '#[0-9]+' | tr -d '#' | sort -un || true)
+            fi
           fi
+
+          # Hotfixes: PRs merged straight to master, excluding intermediate patch-release
+          # merges (those have 'from .../releases/v' in their subject). Only when we have
+          # a previous release tag to compare against.
+          hotfix_prs=()
+          if [ -n "${PREV_TAG}" ]; then
+            mapfile -t hotfix_prs < <(
+              git log "${PREV_TAG}..HEAD^1" --first-parent --pretty='%s' \
+                | grep -v 'from [^ ]*/releases/v' \
+                | sed -nE 's/.*\(#([0-9]+)\)[[:space:]]*$/\1/p; s/^Merge pull request #([0-9]+).*/\1/p' \
+                | sort -un
+            )
+          fi
+
+          # Combine feature + hotfix PRs, deduplicated.
+          mapfile -t prs < <(printf '%s\n' "${feature_prs[@]}" "${hotfix_prs[@]}" | grep -v '^$' | sort -un)
 
           # Template-driven: read the release-notes heading from the PR template
           # instead of hardcoding it, so renaming/reordering sections or changing
@@ -152,28 +190,21 @@ jobs:
           [ -z "$rn_heading" ] && rn_heading="## Release Notes"
           echo "::notice::Release-notes heading: ${rn_heading}"
 
-          # PRs bundled in this release = merge commits in range, minus the
-          # release-line merges themselves (head ref under releases/v*).
-          mapfile -t prs < <(
-            git log "$range" --pretty=%s \
-              | grep -v 'from [^ ]*/releases/v' \
-              | sed -nE 's/.*\(#([0-9]+)\)[[:space:]]*$/\1/p; s/^Merge pull request #([0-9]+).*/\1/p' \
-              | sort -un
-          )
-
           bugs=""
           changes=""
           for n in "${prs[@]}"; do
-            title=$(gh pr view "$n" --repo "$REPO" --json title --jq '.title')
-            body=$(gh pr view "$n" --repo "$REPO" --json body --jq '.body')
+            pr_json=$(gh pr view "$n" --repo "$REPO" --json title,url,body)
+            title=$(printf '%s' "$pr_json" | jq -r '.title')
+            body=$(printf '%s' "$pr_json" | jq -r '.body')
             # Text under the release-notes heading, up to the next heading or the
             # template footer separator ("----"), whichever comes first.
+            # NOTE: mirrors build_release_pr_body.sh section() — keep in sync (self-test lives in that script).
             notes=$(printf '%s\n' "$body" \
               | awk -v h="$rn_heading" '
-                  index($0, h) == 1 && !f { f = 1; next }
-                  f && /^#+[[:space:]]/ { exit }
-                  f && /^----/ { exit }
-                  f { print }' \
+                  index($0, h) == 1 && !f { f = 1; d = 0; next }
+                  f && !d && /^#+[[:space:]]/ { d = 1 }
+                  f && !d && /^----/ { d = 1 }
+                  f && !d { print }' \
               | sed '/^[[:space:]]*$/d')
             # Fall back to the PR title so a PR is never silently dropped.
             [ -z "$notes" ] && notes="$title"
@@ -206,7 +237,9 @@ jobs:
         env:
           TAG: ${{ steps.ver.outputs.tag }}
           PREV_TAG: ${{ steps.ver.outputs.prev_tag }}
+          LANDING: ${{ steps.ver.outputs.landing }}
           MERGED_AT: ${{ github.event.pull_request.merged_at }}
+          MERGED_REF: ${{ github.event.pull_request.head.ref }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -214,23 +247,34 @@ jobs:
           set -euo pipefail
 
           # The PR description mirrors THIS release PR's own diff: only the PRs
-          # merged into the release branch (HEAD^1..HEAD^2). This is narrower than
-          # the tag notes on purpose — the tag covers everything shipping on
-          # master (incl. hotfixes merged straight to master), but a direct-to-
-          # master PR is not part of this PR's Files changed, so listing it in the
-          # description would contradict the diff. gh pr edit is idempotent.
-          if git rev-parse -q --verify HEAD^2 >/dev/null 2>&1; then
+          # merged into the release branch. This is narrower than the tag notes on
+          # purpose — the tag covers everything shipping on master (incl. hotfixes
+          # merged straight to master), but a direct-to-master PR is not part of
+          # this PR's Files changed, so listing it would contradict the diff.
+          # Split discovery by landing type (merge vs. squash).
+          if [ "$LANDING" = "merge" ]; then
             range="HEAD^1..HEAD^2"
-          # Fast-forward merge (no merge commit): fall back to since prev tag.
-          elif git ls-remote --exit-code --tags origin "refs/tags/${PREV_TAG}" >/dev/null 2>&1; then
-            range="${PREV_TAG}..HEAD"
           else
-            range="HEAD"
+            # Squash: try to fetch the release branch (primary), or fall back to
+            # the PR description's Bundles line (squash+deleted case).
+            if git fetch origin "$MERGED_REF" --quiet 2>/dev/null; then
+              range="HEAD^1..FETCH_HEAD"
+            else
+              # Branch deleted: parse Bundles and pass as --pr-list argument to script.
+              synced_body=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json body --jq '.body')
+              feature_prs=$(printf '%s\n' "$synced_body" | grep '^Release.*Bundles ' | grep -oE '#[0-9]+' | tr -d '#' | sort -un || true)
+              pr_list_mode="--pr-list"
+            fi
           fi
 
           date_str="${MERGED_AT%%T*}"
-          body=$(bash .github/scripts/build_release_pr_body.sh "$range" \
-            "Release \`${TAG}\` (${date_str}).")
+          if [ -n "${pr_list_mode:-}" ]; then
+            body=$(bash .github/scripts/build_release_pr_body.sh \
+              "$pr_list_mode" "$feature_prs" "Release \`${TAG}\` (${date_str}).")
+          else
+            body=$(bash .github/scripts/build_release_pr_body.sh "$range" \
+              "Release \`${TAG}\` (${date_str}).")
+          fi
           printf '%s\n' "$body" > "$RUNNER_TEMP/pr-body.md"
           gh pr edit "$PR_NUMBER" --repo "$REPO" --body-file "$RUNNER_TEMP/pr-body.md"
           echo "::notice::Rewrote description of PR #${PR_NUMBER}."
@@ -284,6 +328,8 @@ jobs:
     # Fires when a PR merges INTO a major release branch (releases/vN.0). Keeps
     # the open release->master PR body in sync with the feature PRs bundled so
     # far, instead of only rewriting it when the release itself merges to master.
+    # NOTE: mirrors split-source logic in next-release-branch job — keep in sync
+    # (self-test for sed patterns lives in build_release_pr_body.sh).
     if: >-
       github.event.pull_request.merged == true &&
       github.event.pull_request.base.repo.full_name == github.repository &&
@@ -315,6 +361,7 @@ jobs:
             exit 0
           fi
           # Bundled so far = commits on the release branch not yet on master.
+          # NOTE: mirrors build_release_pr_body.sh discovery — keep in sync (self-test lives in that script).
           git fetch origin master --quiet
           body=$(bash .github/scripts/build_release_pr_body.sh "origin/master..HEAD" \
             "Release branch \`${RELEASE_BRANCH}\` — in progress.")
