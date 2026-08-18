@@ -140,6 +140,7 @@ jobs:
             # Feature PRs: commits on release branch that are not the release merge itself.
             mapfile -t feature_prs < <(
               git log HEAD^1..HEAD^2 --first-parent --pretty='%s' \
+                | grep -vE '^Release releases/v' \
                 | sed -nE 's/.*\(#([0-9]+)\)[[:space:]]*$/\1/p; s/^Merge pull request #([0-9]+).*/\1/p' \
                 | sort -un
             )
@@ -151,6 +152,7 @@ jobs:
             if git fetch origin "$MERGED_REF" --quiet 2>/dev/null; then
               mapfile -t feature_prs < <(
                 git log HEAD^1..FETCH_HEAD --first-parent --pretty='%s' \
+                  | grep -vE '^Release releases/v' \
                   | sed -nE 's/.*\(#([0-9]+)\)[[:space:]]*$/\1/p; s/^Merge pull request #([0-9]+).*/\1/p' \
                   | sort -un
               )
@@ -169,13 +171,19 @@ jobs:
             mapfile -t hotfix_prs < <(
               git log "${PREV_TAG}..HEAD^1" --first-parent --pretty='%s' \
                 | grep -v 'from [^ ]*/releases/v' \
+                | grep -vE '^Release releases/v' \
                 | sed -nE 's/.*\(#([0-9]+)\)[[:space:]]*$/\1/p; s/^Merge pull request #([0-9]+).*/\1/p' \
                 | sort -un
             )
           fi
 
-          # Combine feature + hotfix PRs, deduplicated.
-          mapfile -t prs < <(printf '%s\n' "${feature_prs[@]}" "${hotfix_prs[@]}" | grep -v '^$' | sort -un)
+          # Combine feature + hotfix PRs, deduplicated, excluding the release PR itself.
+          mapfile -t prs < <(
+            printf '%s\n' "${feature_prs[@]}" "${hotfix_prs[@]}" \
+              | grep -v '^$' \
+              | { if [ -n "${PR_NUMBER:-}" ]; then grep -vFx "$PR_NUMBER"; else cat; fi; } \
+              | sort -un
+          )
 
           # Template-driven: read the release-notes heading from the PR template
           # instead of hardcoding it, so renaming/reordering sections or changing
