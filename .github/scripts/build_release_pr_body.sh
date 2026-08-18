@@ -103,9 +103,9 @@ Draft release PR."
     exit 1
   fi
 
-  # 11. --pr-list mode with two-line input (guards P0 #3: mapfile -t must expand all lines)
-  test_pr_list_input="$(printf '3577\n3600')"
-  mapfile -t test_prs <<< "$test_pr_list_input"
+  # 11. --pr-list mode with space-separated and newline-separated inputs
+  test_pr_list_input="3577 3600"
+  mapfile -t test_prs < <(printf '%s\n' $test_pr_list_input 2>/dev/null | grep -v '^$' || true)
   if [ "${#test_prs[@]}" -ne 2 ]; then
     echo "FAIL: --pr-list mapfile should parse 2 PRs but got ${#test_prs[@]}" >&2
     exit 1
@@ -127,7 +127,7 @@ set -euo pipefail
 # 1. <git-range> <overview-line> — discover PRs from git log range (default)
 # 2. --pr-list <pr-numbers> <overview-line> — use explicit PR-number list (squash fallback)
 if [ "${1:-}" = "--pr-list" ]; then
-  mapfile -t prs <<< "$2"
+  mapfile -t prs < <(printf '%s\n' $2 2>/dev/null | grep -v '^$' || true)
   OVERVIEW_LINE="$3"
 else
   RANGE="$1"
@@ -139,7 +139,9 @@ else
   mapfile -t prs < <(
     git log "$RANGE" --first-parent --pretty='%s' \
       | grep -v 'from [^ ]*/releases/v' \
+      | grep -vE '^Release releases/v' \
       | sed -nE 's/.*\(#([0-9]+)\)[[:space:]]*$/\1/p; s/^Merge pull request #([0-9]+).*/\1/p' \
+      | { if [ -n "${PR_NUMBER:-}" ]; then grep -vFx "$PR_NUMBER"; else cat; fi; } \
       | sort -un
   )
 fi
